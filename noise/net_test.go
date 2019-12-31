@@ -1,6 +1,7 @@
 package noise
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -291,6 +292,11 @@ func TestConn(t *testing.T) {
 
 		require.Equal(t, writeB, readB)
 	})
+}
+
+func TestNew(t *testing.T) {
+	conn, err := tls.Dial("tcp", "127.0.0.1:8080", nil)
+	require.NoError(t, err)
 }
 
 func prepareConns(t *testing.T) (*Conn, *Conn, func()) {

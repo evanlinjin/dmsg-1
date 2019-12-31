@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -43,9 +45,13 @@ type ReadWriter struct {
 	origin io.ReadWriter
 	ns     *Noise
 
-	rawInput *bufio.Reader
-	input    bytes.Buffer
-	rMx      sync.Mutex
+	rawIn bytes.Buffer // raw input, starting with a record header
+	in    bytes.Reader // application data waiting to be read, from rawIn.Next
+	inErr error
+
+	rawInputOld *bufio.Reader
+	inputOld    bytes.Buffer
+	rMx         sync.Mutex
 
 	wPad bytes.Reader
 	wMx  sync.Mutex
@@ -54,9 +60,9 @@ type ReadWriter struct {
 // NewReadWriter constructs a new ReadWriter.
 func NewReadWriter(rw io.ReadWriter, ns *Noise) *ReadWriter {
 	return &ReadWriter{
-		origin:   rw,
-		ns:       ns,
-		rawInput: bufio.NewReaderSize(rw, maxFrameSize*2), // can fit 2 frames.
+		origin:      rw,
+		ns:          ns,
+		rawInputOld: bufio.NewReaderSize(rw, maxFrameSize*2), // can fit 2 frames.
 	}
 }
 
@@ -64,11 +70,11 @@ func (rw *ReadWriter) Read(p []byte) (int, error) {
 	rw.rMx.Lock()
 	defer rw.rMx.Unlock()
 
-	if rw.input.Len() > 0 {
-		return rw.input.Read(p)
+	if rw.inputOld.Len() > 0 {
+		return rw.inputOld.Read(p)
 	}
 
-	ciphertext, err := ReadRawFrame(rw.rawInput)
+	ciphertext, err := ReadRawFrame(rw.rawInputOld)
 	if err != nil {
 		return 0, err
 	}
@@ -80,7 +86,7 @@ func (rw *ReadWriter) Read(p []byte) (int, error) {
 	if len(plaintext) == 0 {
 		return 0, nil
 	}
-	return ioutil.BufRead(&rw.input, plaintext, p)
+	return ioutil.BufRead(&rw.inputOld, plaintext, p)
 }
 
 func (rw *ReadWriter) Write(p []byte) (n int, err error) {
@@ -120,9 +126,9 @@ func (rw *ReadWriter) Handshake(hsTimeout time.Duration) error {
 	errCh := make(chan error, 1)
 	go func() {
 		if rw.ns.init {
-			errCh <- InitiatorHandshake(rw.ns, rw.rawInput, rw.origin)
+			errCh <- InitiatorHandshake(rw.ns, rw.rawInputOld, rw.origin)
 		} else {
-			errCh <- ResponderHandshake(rw.ns, rw.rawInput, rw.origin)
+			errCh <- ResponderHandshake(rw.ns, rw.rawInputOld, rw.origin)
 		}
 		close(errCh)
 	}()
@@ -235,6 +241,41 @@ func ReadRawFrame(r *bufio.Reader) (p []byte, err error) {
 	return b[prefixSize:], nil
 }
 
+func (rw *ReadWriter) readFrame() error {
+	if rw.inErr != nil {
+		return rw.inErr
+	}
+
+	// This function modifies c.rawIn, which owns the c.in memory.
+	if rw.in.Len() != 0 {
+		rw.inErr = errors.New("dmsg.Noise: internal error: attempted to read frame with pending application data")
+	}
+	rw.in.Reset(nil)
+
+	// Read header, payload.
+	if err := rw.readFromUntil(rw.origin, prefixSize); err != nil {
+		if e, ok := err.(net.Error); !ok || !e.Temporary() {
+			rw.inErr = err
+		}
+		return err
+	}
+}
+
+// readFromUntil reads from r into c.rawIn until c.rawIn contains
+// at least n bytes or else returns an error.
+func (rw *ReadWriter) readFromUntil(r io.Reader, n int) error {
+	if rw.rawIn.Len() >= n {
+		return nil
+	}
+	needs := n - rw.rawIn.Len()
+	// There might be extra input waiting on the wire. Make a best effort
+	// attempt to fetch it so that it can be used in (*Conn).Read to
+	// "predict" closeNotify alerts.
+	rw.rawIn.Grow(needs + bytes.MinRead)
+	_, err := rw.rawIn.ReadFrom(&atLeastReader{r, int64(needs)})
+	return err
+}
+
 // IsCompleteFrame determines if a frame is fully formed.
 func IsCompleteFrame(b []byte) bool {
 	if len(b) < prefixSize || len(b[prefixSize:]) != int(binary.BigEndian.Uint16(b)) {
@@ -252,4 +293,27 @@ func FillIncompleteFrame(b []byte) []byte {
 	}
 	b = append(b, make([]byte, binary.BigEndian.Uint16(b))...)
 	return b[originalLen:]
+}
+
+// atLeastReader reads from R, stopping with EOF once at least N bytes have been
+// read. It is different from an io.LimitedReader in that it doesn't cut short
+// the last Read call, and in that it considers an early EOF an error.
+type atLeastReader struct {
+	R io.Reader
+	N int64
+}
+
+func (r *atLeastReader) Read(p []byte) (int, error) {
+	if r.N <= 0 {
+		return 0, io.EOF
+	}
+	n, err := r.R.Read(p)
+	r.N -= int64(n) // won't underflow unless len(p) >= n > 9223372036854775809
+	if r.N > 0 && err == io.EOF {
+		return n, io.ErrUnexpectedEOF
+	}
+	if r.N <= 0 && err == nil {
+		return n, io.EOF
+	}
+	return n, err
 }
