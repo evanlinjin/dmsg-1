@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,8 +50,8 @@ func TestNewReadWriter(t *testing.T) {
 
 		hsCh := make(chan error, 2)
 		defer close(hsCh)
-		go func() { hsCh <- aRW.Handshake(time.Second) }()
-		go func() { hsCh <- bRW.Handshake(time.Second) }()
+		go func() { hsCh <- aRW.Handshake() }()
+		go func() { hsCh <- bRW.Handshake() }()
 		require.NoError(t, <-hsCh)
 		require.NoError(t, <-hsCh)
 
@@ -131,9 +130,10 @@ func TestReadWriterKKPattern(t *testing.T) {
 	rwR := NewReadWriter(connR, nR)
 
 	errCh := make(chan error)
-	go func() { errCh <- rwR.Handshake(time.Second) }()
-	require.NoError(t, rwI.Handshake(time.Second))
+	go func() { errCh <- rwR.Handshake() }()
+	require.NoError(t, rwI.Handshake())
 	require.NoError(t, <-errCh)
+	fmt.Println("Handshake done!")
 
 	go func() {
 		_, err := rwI.Write([]byte("foo"))
@@ -187,8 +187,8 @@ func TestReadWriterXKPattern(t *testing.T) {
 	rwR := NewReadWriter(connR, nR)
 
 	errCh := make(chan error)
-	go func() { errCh <- rwR.Handshake(time.Second) }()
-	require.NoError(t, rwI.Handshake(time.Second))
+	go func() { errCh <- rwR.Handshake() }()
+	require.NoError(t, rwI.Handshake())
 	require.NoError(t, <-errCh)
 
 	go func() {

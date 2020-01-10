@@ -265,11 +265,83 @@ func TestConn(t *testing.T) {
 		}
 	})
 
+	t.Run("TestConn2", func(t *testing.T) {
+
+		certPem := []byte(`-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIQIRi6zePL6mKjOipn+dNuaTAKBggqhkjOPQQDAjASMRAw
+DgYDVQQKEwdBY21lIENvMB4XDTE3MTAyMDE5NDMwNloXDTE4MTAyMDE5NDMwNlow
+EjEQMA4GA1UEChMHQWNtZSBDbzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD0d
+7VNhbWvZLWPuj/RtHFjvtJBEwOkhbN/BnnE8rnZR8+sbwnc/KhCk3FhnpHZnQz7B
+5aETbbIgmuvewdjvSBSjYzBhMA4GA1UdDwEB/wQEAwICpDATBgNVHSUEDDAKBggr
+BgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MCkGA1UdEQQiMCCCDmxvY2FsaG9zdDo1
+NDUzgg4xMjcuMC4wLjE6NTQ1MzAKBggqhkjOPQQDAgNIADBFAiEA2zpJEPQyz6/l
+Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
+6MF9+Yw1Yy0t
+-----END CERTIFICATE-----`)
+
+		keyPem := []byte(`-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIIrYSSNQFaA2Hwf1duRSxKtLYX5CB04fSeQ6tF1aY/PuoAoGCCqGSM49
+AwEHoUQDQgAEPR3tU2Fta9ktY+6P9G0cWO+0kETA6SFs38GecTyudlHz6xvCdz8q
+EKTcWGekdmdDPsHloRNtsiCa697B2O9IFA==
+-----END EC PRIVATE KEY-----`)
+
+		cert, err := tls.X509KeyPair(certPem, keyPem)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		cfgS := &tls.Config{Certificates: []tls.Certificate{cert}}
+		cfgC := &tls.Config{InsecureSkipVerify: true}
+
+		nettest.TestConn(t, func() (c1, c2 net.Conn, stop func(), err error) {
+			raw1, raw2 := net.Pipe()
+
+			//lis, err := nettest.NewLocalListener("tcp")
+			//require.NoError(t, err)
+			//
+			//raw2, err := net.Dial("tcp", lis.Addr().String())
+			//require.NoError(t, err)
+			//
+			//raw1, err := lis.Accept()
+			//require.NoError(t, err)
+
+
+			c1 = tls.Server(raw1, cfgS)
+			c2 = tls.Client(raw2, cfgC)
+
+			//// Handshake logic.
+			//err1 := make(chan error, 1)
+			//err2 := make(chan error, 2)
+			//go func() {
+			//	_, err := c1.Read(nil)
+			//	err1 <- err
+			//	close(err1)
+			//}()
+			//go func() {
+			//	_, err := c2.Read(nil)
+			//	err2 <- err
+			//	close(err2)
+			//}()
+			//require.NoError(t, <-err1)
+			//require.NoError(t, <-err2)
+			//fmt.Println("Handshake okay!")
+
+			stop = func() {
+				fmt.Println("Stopping...")
+				//require.NoError(t, lis.Close())
+				go c1.Close()
+				go c2.Close()
+				fmt.Println("Stopped!")
+			}
+			return
+		})
+	})
+
 	t.Run("TestLargeDataIO", func(t *testing.T) {
 		c1, c2, stop := prepareConns(t)
 		defer stop()
 
-		writeB := cipher.RandByte(MaxWriteSize)
+		writeB := cipher.RandByte(MaxWriteSize*20)
 		readB := make([]byte, len(writeB))
 
 		var (
@@ -292,11 +364,6 @@ func TestConn(t *testing.T) {
 
 		require.Equal(t, writeB, readB)
 	})
-}
-
-func TestNew(t *testing.T) {
-	conn, err := tls.Dial("tcp", "127.0.0.1:8080", nil)
-	require.NoError(t, err)
 }
 
 func prepareConns(t *testing.T) (*Conn, *Conn, func()) {
@@ -330,8 +397,8 @@ func prepareConns(t *testing.T) (*Conn, *Conn, func()) {
 	bRW := NewReadWriter(bConn, bNs)
 
 	errChan := make(chan error, 2)
-	go func() { errChan <- aRW.Handshake(timeout) }()
-	go func() { errChan <- bRW.Handshake(timeout) }()
+	go func() { errChan <- aRW.Handshake() }()
+	go func() { errChan <- bRW.Handshake() }()
 	require.NoError(t, <-errChan)
 	require.NoError(t, <-errChan)
 	close(errChan)

@@ -9,10 +9,9 @@ import (
 	"io"
 	"net"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/SkycoinProject/dmsg/cipher"
-	"github.com/SkycoinProject/dmsg/ioutil"
 )
 
 // MaxWriteSize is the largest amount for a single write.
@@ -21,11 +20,18 @@ const MaxWriteSize = maxPayloadSize
 // Frame format: [ len (2 bytes) | auth & nonce (24 bytes) | payload (<= maxPayloadSize bytes) ]
 const (
 	maxFrameSize   = 4096                                 // maximum frame size (4096)
-	maxPayloadSize = maxFrameSize - prefixSize - authSize // maximum payload size
-	maxPrefixValue = maxFrameSize - prefixSize            // maximum value contained in the 'len' prefix
+	maxPayloadSize = maxFrameSize - hdrSize - authSize // maximum payload size
+	maxPrefixValue = maxFrameSize - hdrSize            // maximum value contained in the 'len' prefix
 
-	prefixSize = 2  // len prefix size
-	authSize   = 24 // noise auth data size
+	hdrSize  = 3 // Header size: 1 byte (typ), 2 bytes (pay len)
+	authSize = 24 // noise auth data size
+)
+
+// Frame types.
+const (
+	TypHandshake = byte(0)
+	TypClose     = byte(1)
+	TypData      = byte(2)
 )
 
 type timeoutError struct{}
@@ -45,16 +51,20 @@ type ReadWriter struct {
 	origin io.ReadWriter
 	ns     *Noise
 
-	rawIn bytes.Buffer // raw input, starting with a record header
+	hs     bytes.Buffer
+	hsStat uint32
+	hsErr  error
+	hsMx   sync.Mutex
+
+	rawIn bytes.Buffer // raw input, starting with a frame header
 	in    bytes.Reader // application data waiting to be read, from rawIn.Next
 	inErr error
-
 	rawInputOld *bufio.Reader
-	inputOld    bytes.Buffer
-	rMx         sync.Mutex
+	inMx        sync.Mutex
 
-	wPad bytes.Reader
-	wMx  sync.Mutex
+	outBuf []byte
+	outErr error
+	outMx sync.Mutex
 }
 
 // NewReadWriter constructs a new ReadWriter.
@@ -67,78 +77,50 @@ func NewReadWriter(rw io.ReadWriter, ns *Noise) *ReadWriter {
 }
 
 func (rw *ReadWriter) Read(p []byte) (int, error) {
-	rw.rMx.Lock()
-	defer rw.rMx.Unlock()
-
-	if rw.inputOld.Len() > 0 {
-		return rw.inputOld.Read(p)
-	}
-
-	ciphertext, err := ReadRawFrame(rw.rawInputOld)
-	if err != nil {
+	if err := rw.Handshake(); err != nil {
 		return 0, err
 	}
-	plaintext, err := rw.ns.DecryptUnsafe(ciphertext)
-	if err != nil {
-		// TODO(evanlinjin): log error here.
+	if len(p) == 0 {
+		// Put this after Handshake, in case people were calling
+		// Read(nil) for the side effect of the Handshake.
 		return 0, nil
 	}
-	if len(plaintext) == 0 {
-		return 0, nil
-	}
-	return ioutil.BufRead(&rw.inputOld, plaintext, p)
-}
 
-func (rw *ReadWriter) Write(p []byte) (n int, err error) {
-	rw.wMx.Lock()
-	defer rw.wMx.Unlock()
+	rw.inMx.Lock()
+	defer rw.inMx.Unlock()
 
-	if _, err = rw.origin.Write(nil); err != nil {
-		return 0, err
-	}
-
-	for rw.wPad.Len() > 0 {
-		if _, err = rw.wPad.WriteTo(rw.origin); err != nil {
+	if rw.in.Len() == 0 {
+		if err := rw.readFrame(); err != nil {
+			fmt.Println("Read:", 0, err)
 			return 0, err
 		}
 	}
 
-	// Enforce max frame size.
-	if len(p) > maxPayloadSize {
-		p, err = p[:maxPayloadSize], io.ErrShortWrite
-	}
-
-	writtenB, wErr := WriteRawFrame(rw.origin, rw.ns.EncryptUnsafe(p))
-
-	if !IsCompleteFrame(writtenB) {
-		rw.wPad.Reset(FillIncompleteFrame(writtenB))
-	}
-
-	if wErr != nil {
-		return 0, wErr
-	}
-
-	return len(p), err
+	n, _ := rw.in.Read(p)
+	fmt.Println("Read:", n, nil)
+	return n, nil
 }
 
-// Handshake performs a Noise handshake using the provided io.ReadWriter.
-func (rw *ReadWriter) Handshake(hsTimeout time.Duration) error {
-	errCh := make(chan error, 1)
-	go func() {
-		if rw.ns.init {
-			errCh <- InitiatorHandshake(rw.ns, rw.rawInputOld, rw.origin)
-		} else {
-			errCh <- ResponderHandshake(rw.ns, rw.rawInputOld, rw.origin)
-		}
-		close(errCh)
-	}()
-	select {
-	case err := <-errCh:
-		return err
-	case <-time.After(hsTimeout):
-		return timeoutError{}
+func (rw *ReadWriter) Write(p []byte) (int, error) {
+
+	// TODO(evanlinjin): Interlock with Close.
+
+	if err := rw.Handshake(); err != nil {
+		return 0, err
 	}
+
+	rw.outMx.Lock()
+	defer rw.outMx.Unlock()
+
+	if err := rw.outErr; err != nil {
+		return 0, err
+	}
+
+	n, err := rw.writeFrame(TypData, p)
+	fmt.Println("Write:", n, err)
+	return n, err
 }
+
 
 // LocalStatic returns the local static public key.
 func (rw *ReadWriter) LocalStatic() cipher.PubKey {
@@ -150,95 +132,36 @@ func (rw *ReadWriter) RemoteStatic() cipher.PubKey {
 	return rw.ns.RemoteStatic()
 }
 
-// InitiatorHandshake performs a noise handshake as an initiator.
-func InitiatorHandshake(ns *Noise, r *bufio.Reader, w io.Writer) error {
-	for {
-		msg, err := ns.MakeHandshakeMessage()
-		if err != nil {
-			return err
+func (rw *ReadWriter) writeFrame(typ byte, data []byte) (int, error) {
+	var n int
+	for len(data) > 0 {
+		m := len(data)
+		if m > maxPayloadSize {
+			m = maxPayloadSize
 		}
-		if _, err := WriteRawFrame(w, msg); err != nil {
-			return err
-		}
-		if ns.HandshakeFinished() {
-			break
-		}
-		res, err := ReadRawFrame(r)
-		if err != nil {
-			return err
-		}
-		if err = ns.ProcessHandshakeMessage(res); err != nil {
-			return err
-		}
-		if ns.HandshakeFinished() {
-			break
-		}
-	}
-	return nil
-}
 
-// ResponderHandshake performs a noise handshake as a responder.
-func ResponderHandshake(ns *Noise, r *bufio.Reader, w io.Writer) error {
-	for {
-		msg, err := ReadRawFrame(r)
-		if err != nil {
-			return err
+		var payload []byte
+		if rw.ns.HandshakeFinished() && typ != TypHandshake {
+			payload = rw.ns.EncryptUnsafe(data[:m])
+		} else {
+			payload = data
 		}
-		if err := ns.ProcessHandshakeMessage(msg); err != nil {
-			return err
-		}
-		if ns.HandshakeFinished() {
-			break
-		}
-		res, err := ns.MakeHandshakeMessage()
-		if err != nil {
-			return err
-		}
-		if _, err := WriteRawFrame(w, res); err != nil {
-			return err
-		}
-		if ns.HandshakeFinished() {
-			break
-		}
-	}
-	return nil
-}
 
-// WriteRawFrame writes a raw frame (data prefixed with a uint16 len).
-// It returns the bytes written.
-func WriteRawFrame(w io.Writer, p []byte) ([]byte, error) {
-	buf := make([]byte, prefixSize+len(p))
-	binary.BigEndian.PutUint16(buf, uint16(len(p)))
-	copy(buf[prefixSize:], p)
+		frame := make([]byte, hdrSize+len(payload))
+		frame[0] = typ
+		binary.BigEndian.PutUint16(frame[1:], uint16(len(payload)))
+		copy(frame[hdrSize:], payload)
 
-	n, err := w.Write(buf)
-	return buf[:n], err
-}
+		//rw.outBuf = append(rw.outBuf, frame...)
 
-// ReadRawFrame attempts to read a raw frame from a buffered reader.
-func ReadRawFrame(r *bufio.Reader) (p []byte, err error) {
-	prefixB, err := r.Peek(prefixSize)
-	if err != nil {
-		return nil, err
-	}
-
-	// obtain payload size
-	prefix := int(binary.BigEndian.Uint16(prefixB))
-	if prefix > maxPrefixValue {
-		return nil, &netError{
-			Err: fmt.Errorf("noise prefix value %dB exceeds maximum %dB", prefix, maxPrefixValue),
+		if _, err := rw.origin.Write(frame); err != nil {
+			return n, err
 		}
-	}
 
-	// obtain payload
-	b, err := r.Peek(prefixSize + prefix)
-	if err != nil {
-		return nil, err
+		n += m
+		data = data[m:]
 	}
-	if _, err := r.Discard(prefixSize + prefix); err != nil {
-		panic(fmt.Errorf("unexpected error when discarding %d bytes: %v", prefixSize+prefix, err))
-	}
-	return b[prefixSize:], nil
+	return n, nil
 }
 
 func (rw *ReadWriter) readFrame() error {
@@ -252,13 +175,58 @@ func (rw *ReadWriter) readFrame() error {
 	}
 	rw.in.Reset(nil)
 
-	// Read header, payload.
-	if err := rw.readFromUntil(rw.origin, prefixSize); err != nil {
+	// Read header.
+	if err := rw.readFromUntil(rw.origin, hdrSize); err != nil {
+		if e, ok := err.(net.Error); !ok || !e.Temporary() {
+			rw.inErr = err
+		}
+		fmt.Println("Failed to read header!", err)
+		return err
+	}
+	hdr := rw.rawIn.Bytes()[:hdrSize] //int(binary.BigEndian.Uint16(rw.rawIn.Bytes()[:hdrSize]))
+	typ := hdr[0]
+	if typ != TypData {
+		// TODO
+	}
+
+	n := int(binary.BigEndian.Uint16(hdr[1:]))
+
+	// Read payload.
+	if err := rw.readFromUntil(rw.origin, hdrSize+n); err != nil {
 		if e, ok := err.(net.Error); !ok || !e.Temporary() {
 			rw.inErr = err
 		}
 		return err
 	}
+	frame := rw.rawIn.Next(hdrSize + n)
+
+	// Decrypt.
+	var data []byte
+	if rw.ns.HandshakeFinished() {
+		var err error
+		if data, err = rw.ns.DecryptUnsafe(frame[hdrSize:]); err != nil {
+			rw.inErr = err
+			return err
+		}
+	} else {
+		data = frame[hdrSize:]
+	}
+
+	switch typ {
+	case TypData:
+		// Note that data is owned by rw.rawIn, following the Next call above,
+		// to avoid copying the plaintext. This is safe because rw.rawIn is
+		// not read from or written to until rw.in is drained.
+		rw.in.Reset(data)
+
+	case TypHandshake:
+		if len(data) == 0 {
+			// TODO(evanlinjin): error.
+		}
+		rw.hs.Write(data)
+	}
+
+	return nil
 }
 
 // readFromUntil reads from r into c.rawIn until c.rawIn contains
@@ -272,27 +240,8 @@ func (rw *ReadWriter) readFromUntil(r io.Reader, n int) error {
 	// attempt to fetch it so that it can be used in (*Conn).Read to
 	// "predict" closeNotify alerts.
 	rw.rawIn.Grow(needs + bytes.MinRead)
-	_, err := rw.rawIn.ReadFrom(&atLeastReader{r, int64(needs)})
+	_, err := rw.rawIn.ReadFrom(&atLeastReader{R: r, N: int64(needs)})
 	return err
-}
-
-// IsCompleteFrame determines if a frame is fully formed.
-func IsCompleteFrame(b []byte) bool {
-	if len(b) < prefixSize || len(b[prefixSize:]) != int(binary.BigEndian.Uint16(b)) {
-		return false
-	}
-	return true
-}
-
-// FillIncompleteFrame takes in an incomplete frame, and returns empty bytes to fill the incomplete frame.
-func FillIncompleteFrame(b []byte) []byte {
-	originalLen := len(b)
-
-	for len(b) < prefixSize {
-		b = append(b, byte(0))
-	}
-	b = append(b, make([]byte, binary.BigEndian.Uint16(b))...)
-	return b[originalLen:]
 }
 
 // atLeastReader reads from R, stopping with EOF once at least N bytes have been
@@ -316,4 +265,79 @@ func (r *atLeastReader) Read(p []byte) (int, error) {
 		return n, io.EOF
 	}
 	return n, err
+}
+
+/* HANDSHAKE STUFF */
+
+func (rw *ReadWriter) Handshake() error {
+	rw.hsMx.Lock()
+	defer rw.hsMx.Unlock()
+
+	if err := rw.hsErr; err != nil {
+		return err
+	}
+	if rw.handshakeComplete() {
+		return nil
+	}
+
+	var hsActions [2]func() error
+	if init := rw.ns.init; init {
+		hsActions[0] = rw.writeHandshakeFrame
+		hsActions[1] = rw.readHandshakeFrame
+	} else {
+		hsActions[0] = rw.readHandshakeFrame
+		hsActions[1] = rw.writeHandshakeFrame
+	}
+
+	for {
+		for _, action := range hsActions {
+			if err := action(); err != nil {
+				rw.hsErr = err
+				goto hsDone
+			}
+			if rw.ns.HandshakeFinished() {
+				atomic.StoreUint32(&rw.hsStat, 1)
+				goto hsDone
+			}
+		}
+	}
+
+hsDone:
+	if rw.hsErr == nil && !rw.ns.HandshakeFinished() {
+		rw.hsErr = errors.New("noise: internal error: handshake should have had a result")
+	}
+	return rw.hsErr
+}
+
+func (rw *ReadWriter) writeHandshakeFrame() error {
+	msg, err := rw.ns.MakeHandshakeMessage()
+	if err != nil {
+		fmt.Printf("[%s:writeHandshakeFrame] %d, %v\n", rw.ns.LocalStatic(), len(msg), err)
+		return err
+	}
+	if _, err := rw.writeFrame(TypHandshake, msg); err != nil {
+		fmt.Printf("[%s:writeHandshakeFrame] %d, %v\n", rw.ns.LocalStatic(), len(msg), err)
+		return err
+	}
+	fmt.Printf("[%s:writeHandshakeFrame] %d, %v (%v)\n", rw.ns.LocalStatic(), len(msg), err, msg)
+	return nil
+}
+
+func (rw *ReadWriter) readHandshakeFrame() error {
+	if err := rw.readFrame(); err != nil {
+		fmt.Printf("[%s:readHandshakeFrame] %d, %v\n", rw.ns.LocalStatic(), -1, nil)
+		return err
+	}
+
+	msg := rw.hs.Next(rw.hs.Len())
+	if err := rw.ns.ProcessHandshakeMessage(msg); err != nil {
+		fmt.Printf("[%s:readHandshakeFrame] %d, %v (%v)\n", rw.ns.LocalStatic(), len(msg), err, msg)
+		return err
+	}
+	fmt.Printf("[%s:readHandshakeFrame] %d, %v (%v)\n", rw.ns.LocalStatic(), len(msg), nil, msg)
+	return nil
+}
+
+func (rw *ReadWriter) handshakeComplete() bool {
+	return atomic.LoadUint32(&rw.hsStat) == 1
 }

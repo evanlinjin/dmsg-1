@@ -166,7 +166,7 @@ type Conn struct {
 // WrapConn wraps a provided net.Conn with noise.
 func WrapConn(conn net.Conn, ns *Noise, hsTimeout time.Duration) (*Conn, error) {
 	rw := NewReadWriter(conn, ns)
-	if err := rw.Handshake(hsTimeout); err != nil {
+	if err := rw.Handshake(); err != nil {
 		return nil, err
 	}
 	return &Conn{Conn: conn, ns: rw}, nil
@@ -229,7 +229,7 @@ func (ml *Listener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 		rw := NewReadWriter(conn, ns)
-		if err := rw.Handshake(AcceptHandshakeTimeout); err != nil {
+		if err := rw.Handshake(); err != nil {
 			noiseLogger.WithError(err).Warn("accept: noise handshake failed.")
 			continue
 		}
